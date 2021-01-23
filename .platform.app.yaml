@@ -1,0 +1,77 @@
+name: application
+type: "python:3.7"
+disk: 256
+
+relationships:
+    database: "database:postgresql"
+    cache: "cache:redis"
+
+dependencies:
+    python3:
+        platformshconfig: "2.3.1"
+        meinheld: "*"
+
+# variables:
+#     env:
+#         PYBOSSA_SETTINGS: settings.py
+
+hooks:
+    build: |
+        # FIXME: SENTINEL https://github.com/Scifabric/pybossa/pull/1987
+        git clone --recursive --depth=1 --single-branch --branch no-sentinel \
+            https://github.com/Scifabric/pybossa /tmp/code
+
+        rsync --recursive --partial /tmp/code/ .
+        rsync --recursive --partial plugins/ pybossa/plugins
+        rsync --recursive --partial theme/ pybossa/themes/default
+
+        # FIXME: the PYBOSSA_SETTINGS environment variable doesn't do what
+        # it's supposed to do. Moving it is an acceptable fix for now.
+        mv settings.py settings_local.py
+
+        # Link the temporary directories to the writable ./cache scratchpad.
+        for directory in pybossa/themes/default/static/*; do
+            ln --symbolic "$(realpath cache)" "${directory}/gen"
+        done
+
+        # <HACK> Platform.sh does not support the APT package manager, and we
+        # can't install the native OpenLDAP header files required to build the
+        # python-ldap wheel, so we have to resort to a third-party manylinux
+        # wheel that provides a prebuilt vendored copy of the libraries.
+        pip install https://wheels.galaxyproject.org/simple/python-ldap\
+        /python_ldap-3.2.0-cp37-cp37m-manylinux1_x86_64.whl
+        sed --in-place 's/\(python-ldap\)==3.1.0/\1==3.2.0/' setup.py
+        # </HACK>
+
+        pip install --requirement requirements.txt
+    deploy: python deploy.py
+
+
+web:
+    commands:
+        start: python server.py
+
+workers:
+    scheduler:
+        size: S
+        commands:
+            start: |
+                RELATIONSHIPS="$(echo "$PLATFORM_RELATIONSHIPS" | base64 -d)"
+                HOST="$(echo "$RELATIONSHIPS" | jq ".cache[0].host")"
+                PORT="$(echo "$RELATIONSHIPS" | jq ".cache[0].port")"
+                rqscheduler --host "$HOST" --port "$PORT"
+    worker:
+        size: M
+        commands:
+            start: |
+                JOBS="super high medium low email maintenance"
+                python app_context_rqworker.py scheduled_jobs $JOBS
+
+mounts:
+    cache:
+        source: local
+        source_path: asset-cache
+    uploads:
+        source: service
+        service: files
+        source_path: files
